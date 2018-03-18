@@ -1,0 +1,191 @@
+#!/usr/bin/env python2
+
+##############################ROS stuff###############################
+#import roslib; roslib.load_manifest('identity_recognition')
+import rospy
+import actionlib
+
+import identity_recognition.msg
+from actionlib_msgs.msg import GoalStatusArray
+from std_msgs.msg import Empty
+from std_msgs.msg import String
+from cv_bridge import CvBridge, CvBridgeError
+from sensor_msgs.msg import Image
+
+#############################Openface stuff############################
+
+import time
+
+start = time.time()
+
+import argparse
+import cv2
+import os
+import pickle
+
+from operator import itemgetter
+
+import numpy as np
+np.set_printoptions(precision=2)
+import pandas as pd
+
+import openface
+
+from sklearn.pipeline import Pipeline
+from sklearn.lda import LDA
+from sklearn.preprocessing import LabelEncoder
+from sklearn.svm import SVC
+from sklearn.mixture import GMM
+
+currentDir = os.path.dirname(os.path.realpath(__file__))
+fileDir = os.path.join(currentDir, '../../../../projects/openface/')
+modelDir = os.path.join(fileDir, 'models')
+dlibModelDir = os.path.join(modelDir, 'dlib')
+openfaceModelDir = os.path.join(modelDir, 'openface')
+
+verbose = True
+
+align = openface.AlignDlib(os.path.join(dlibModelDir,"shape_predictor_68_face_landmarks.dat"))
+net = openface.TorchNeuralNet(os.path.join(openfaceModelDir, 'nn4.small2.v1.t7'), imgDim=96, cuda=False)
+ 
+class IdentityRecognitionAction(object):
+    _feedback = identity_recognition.msg.IdentityRecognitionFeedback()
+    _result = identity_recognition.msg.IdentityRecognitionResult()
+
+    def __init__(self, name):
+        self._action_name = name
+        self._as = actionlib.SimpleActionServer(self._action_name, identity_recognition.msg.IdentityRecognitionAction, execute_cb=self.execute_cb, auto_start = False)
+        self._as.start()
+        rospy.loginfo('server started')
+        self._bridge = CvBridge()
+        self._robot_type = rospy.get_param("~robot_type")
+        if self._robot_type == "chatterbox":
+            self._image_sub = rospy.Subscriber("/camera/image_raw", Image, self.image_cb)
+            print("robot type chatterbox")
+        if self._robot_type == "bebop":
+            self._image_sub = rospy.Subscriber("/bebop/image_raw", Image, self.image_cb)
+            print("robot type bebop")
+        self._cv_image = []
+        self._get_image = False
+
+    def image_cb(self, data):
+        try:
+            self._cv_image = self._bridge.imgmsg_to_cv2(data, "bgr8")
+        except CvBridgeError as e:
+            print (e)
+        self._get_image = True
+    
+    @classmethod
+    def identity_recognition(self, face_image):
+        start = time.time()
+        #bgrImg = cv2.imread(imgPath) classifier_model = os.path.joindir('/home/lethic/projects/openface/classify-jacob-lingkang/features/classifier.pkl')
+        classifier_model = os.path.join(fileDir, 'classify-jacob-lingkang/features/classifier.pkl')
+        with open(classifier_model, 'r') as f:
+            (le, clf) = pickle.load(f)
+
+        bgrImg = face_image
+        if bgrImg is None:
+            raise Exception("Unable to load image: {}".format(imgPath))
+
+        rgbImg = cv2.cvtColor(bgrImg, cv2.COLOR_BGR2RGB)
+        #rgbImg = bgrImg
+        #if verbose:
+        #    print("  + Original size: {}".format(rgbImg.shape))
+        if verbose:
+            print("Loading the image took {} seconds.".format(time.time() - start))
+
+        start = time.time()
+
+        name = 'notnone'
+        bb = align.getLargestFaceBoundingBox(rgbImg)
+        if bb is None:
+            name = 'none'
+            return 'none'
+            print("detect no face")
+            #raise Exception("Unable to find a face: {}".format(imgPath))
+        if verbose:
+            print("Face detection took {} seconds.".format(time.time() - start))
+
+        if name != 'none':
+            start = time.time()
+            alignedFace = align.align(96, rgbImg, bb,
+                                      landmarkIndices=openface.AlignDlib.OUTER_EYES_AND_NOSE)
+            if alignedFace is None:
+                raise Exception("Unable to align image: {}".format(imgPath))
+            if verbose:
+                print("Alignment took {} seconds.".format(time.time() - start))
+
+            start = time.time()
+            rep = net.forward(alignedFace)
+            if verbose:
+                print("Neural network forward pass took {} seconds.".format(time.time() - start))
+            rep = rep.reshape(1, -1)
+            start = time.time()
+            predictions = clf.predict_proba(rep).ravel()
+            maxI = np.argmax(predictions)
+            person = le.inverse_transform(maxI)
+            confidence = predictions[maxI]
+            if verbose:
+                print("Prediction took {} seconds.".format(time.time() - start))
+            print("Predict {} with {:.2f} confidence.".format(person, confidence))
+            if isinstance(clf, GMM):
+                dist = np.linalg.norm(rep - clf.means_[maxI])
+                print("  + Distance from the mean: {}".format(dist))
+            return person
+        return 'none'
+
+    def execute_cb(self, goal):
+        if self._get_image:
+            success = True
+            self._result.tracker_id = []
+            self._result.name = []
+            self._result.confidence = []
+            # calculate confidence and name using openface
+            for i in range(len(goal.tracker_id)):
+                # check if the preempt has been requested by client
+                if self._as.is_preempt_requested():
+                    rospy.loginfo('%s: Preempted' % self._action_name)
+                    self._as.set_preempted()
+                    success = False
+                    break
+                # recognize face in tracker i
+                self._feedback.tracker_id = goal.tracker_id[i]
+                #self._feedback.tracker_index = i
+                # get conf and name
+                x = goal.x[i]
+                y = goal.y[i]
+                w = goal.width[i]
+                h = goal.height[i]
+                if x < 0:
+                    x = 0
+                if y < 0:
+                    y = 0;
+                print "The face region is:"
+                print (x, y, w, h)
+                face = self._cv_image[y:y+h, x:x+w]
+                #face = cv2.cvtColor(face, cv2.COLOR_BGR2GRAY)
+                if w > 100.0 and h > 100.0:
+                    scale = 100.0/w
+                    face = cv2.resize(face, (0,0), fx=scale, fy=scale)
+                cv2.imshow('Video1', face)
+                cv2.waitKey(1)
+                #self._feedback.name = "xxx"
+                self._feedback.name = IdentityRecognitionAction.identity_recognition(face)
+                self._feedback.confidence = 0.80
+                self._result.tracker_id.append(self._feedback.tracker_id)
+                self._result.name.append(self._feedback.name)
+                self._result.confidence.append(self._feedback.confidence)
+                self._as.publish_feedback(self._feedback)
+
+            if success:
+                self._result.tracker_id = goal.tracker_id
+                rospy.loginfo('%s Succeeded' % self._action_name)
+                self._as.set_succeeded(self._result)
+                #self._as.publish_result(self._result)
+
+            #rospy.loginfo('Recognize face identity for tracker %d')
+
+if __name__ == '__main__':
+    rospy.init_node('identity_recognition')
+    IdentityRecognitionAction(rospy.get_name())
+    rospy.spin()

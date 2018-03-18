@@ -1,0 +1,18 @@
+#goal definition
+uint32[]  tracker_id
+uint32[] x
+uint32[] y
+uint32[] width
+uint32[] height
+---
+#result definition
+uint32[]   tracker_id
+string[]  name
+float32[] confidence
+---
+#feedback
+uint32 tracker_id
+string name
+float32 confidence
+
+
